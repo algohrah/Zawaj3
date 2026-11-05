@@ -1,0 +1,772 @@
+import { Link } from 'react-router-dom';
+import { isFeatured, compareMemberPriority } from '../../shared/membership.js';
+import { calculateCompatibility } from '../lib/compatibility';
+import React, { useState, useEffect } from 'react';
+import { useNavigate, useSearchParams } from 'react-router-dom';
+import { motion, AnimatePresence } from 'framer-motion';
+import { useApp } from '../lib/AppContext';
+import {
+  Search as SearchIcon, SlidersHorizontal, MapPin, Calendar,
+  Briefcase, GraduationCap, Users, ChevronDown, ChevronUp,
+  Globe, BookOpen, Heart, ShieldCheck, Baby, Building2,
+} from 'lucide-react';
+import { Button } from '../components/ui/Button';
+import {
+  ARAB_COUNTRIES, ARAB_CITIES, EDUCATION_LEVELS, JOB_TITLES,
+  SECTS, CHILDREN_COUNTS, getMaritalOptions,
+} from '../lib/types';
+import { CITIES_BY_COUNTRY, NATIONALITIES, WORK_TYPES } from '../lib/constants';
+import MemberCard from '../components/MemberCard';
+import { MemberGridSkeleton } from '../components/ui/MemberCardSkeleton';
+import { dataService } from '../lib/data/DataService';
+import { getMemberTimestamp } from '../lib/memberUtils';
+
+type GenderFilter = 'male' | 'female' | 'all';
+
+const PAGE_SIZE = 16;
+
+export default function Search() {
+  const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const { checkLimit, incrementUsage, showToast, members, membersLoading, membersError, retryLoadMembers, blockedMembers, user, profileData } = useApp();
+  const currentUser = members.find(member => String(member.id) === String(user.memberId));
+  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
+  const featuredAccess = user.isLoggedIn && isFeatured({ plan: user.profile.plan });
+  const [upgradePrompt, setUpgradePrompt] = useState(false);
+  const requireFeatured = () => { setUpgradePrompt(true); showToast('هذا الفلتر متاح لأعضاء الباقة المميزة', 'info'); };
+  useEffect(() => { if (!featuredAccess) { setShowAdvanced(false); setSearchQuery(''); setNationality(''); setEducation(''); setJob(''); setMaritalStatus(''); setSect(''); setHasChildren(''); setChildrenCount(''); setAcceptForeigner(''); } }, [featuredAccess]);
+
+  // ===== الفلاتر الأساسية (مع دعم التهيئة من معايير الرابط) =====
+  const paramGender = searchParams.get('gender') as GenderFilter | null;
+  const paramCountry = searchParams.get('country') || '';
+  const paramCity = searchParams.get('city') || '';
+
+  const [searchQuery, setSearchQuery] = useState('');
+  const [gender, setGender] = useState<GenderFilter>(
+    paramGender === 'male' || paramGender === 'female' || paramGender === 'all' ? paramGender : 'all'
+  );
+  const [ageRange, setAgeRange] = useState<[number, number]>([16, 80]);
+  const [country, setCountry] = useState(paramCountry);
+  const [city, setCity] = useState(paramCity);
+
+  // عند تغيّر معايير الرابط (مثل الضغط على فلتر سريع من الرئيسية)
+  useEffect(() => {
+    const urlGender = searchParams.get('gender') as GenderFilter | null;
+    const urlCountry = searchParams.get('country');
+    const urlCity = searchParams.get('city');
+    const urlType = searchParams.get('type');
+
+    if (urlGender && (urlGender === 'male' || urlGender === 'female' || urlGender === 'all')) {
+      setGender(urlGender);
+    }
+    if (urlCountry !== null) {
+      setCountry(urlCountry);
+    }
+    if (urlCity !== null) {
+      setCity(urlCity);
+    }
+    if (urlType === 'معلن' || urlType === 'announced') {
+      setMarriageType('announced');
+      setShowAdvanced(true);
+    } else if (urlType === 'مسيار' || urlType === 'misyar') {
+      setMarriageType('misyar');
+      setShowAdvanced(true);
+    } else if (urlType === 'all' || urlType === 'الجميع' || urlType === '') {
+      setMarriageType('');
+    }
+  }, [searchParams]);
+
+  // ===== الفلاتر المتقدمة =====
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [marriageType, setMarriageType] = useState<'' | 'announced' | 'misyar'>('');
+  const [acceptForeigner, setAcceptForeigner] = useState<'' | 'yes' | 'no'>('');
+  const [nationality, setNationality] = useState('');
+  const [education, setEducation] = useState('');
+  const [job, setJob] = useState('');
+  const [maritalStatus, setMaritalStatus] = useState('');
+  const [sect, setSect] = useState('');
+  const [hasChildren, setHasChildren] = useState('');
+  const [childrenCount, setChildrenCount] = useState('');
+
+  // نضمن تحميل قوائم الجغرافيا الرسمية من قاعدة البيانات (نفس مصدر التسجيل)
+  React.useEffect(() => { dataService.db.ensureGeoLoaded?.().catch(() => undefined); }, []);
+
+  // الدول والمدن والجنسيات من قاعدة البيانات الموحّدة (مع fallback للقوائم الثابتة)
+  const countryOptions = React.useMemo(() => {
+    const db = dataService.db.getCountryNames?.() || [];
+    return db.length ? db : ARAB_COUNTRIES;
+  }, []);
+  const OTHER_CITY_OPTION = 'أخرى (مدن أخرى)';
+
+  const cityOptions = React.useMemo(() => {
+    if (!country) return [];
+    const db = dataService.db.getCities?.(country) || [];
+    const mainCities = db.length ? db : (CITIES_BY_COUNTRY[country] || []);
+    // نضمن إدراج خيار "أخرى (مدن أخرى)" في نهاية خيارات المدينة للدولة المحددة
+    const uniqueCities = Array.from(new Set(mainCities));
+    return [...uniqueCities, OTHER_CITY_OPTION];
+  }, [country]);
+  const nationalityOptions = React.useMemo(() => {
+    const db = dataService.db.getNationalities?.() || [];
+    return db.length ? db : NATIONALITIES;
+  }, []);
+
+  // خيارات الحالة الاجتماعية حسب الجنس المختار
+  const maritalOptions = gender === 'all' ? [] : getMaritalOptions(gender);
+
+  // عند تغيير الجنس: نعيد ضبط الحالة الاجتماعية لأن الخيارات تختلف
+  const handleGenderChange = (g: GenderFilter) => {
+    setGender(g);
+    setMaritalStatus(''); // إعادة ضبط الحالة الاجتماعية
+    setHasChildren('');
+    setChildrenCount('');
+  };
+
+  // عند اختيار "مطلق/مطلقة" نظهر خيارات الأبناء
+  const showChildrenOptions = ['divorced', 'widower', 'widow', 'widowed', 'مطلق', 'مطلقة', 'أرمل', 'أرملة'].includes(maritalStatus);
+
+  // Live filtering (replaces separate results page - Red Priority #2)
+  const filteredMembers = React.useMemo(() => {
+    const seen = new Set<string>();
+    return members.filter((m, idx) => {
+      if (!m) return false;
+      if (m.status && m.status !== 'active') return false;
+      // إخفاء الأعضاء المحظورين شخصياً من نتائج البحث
+      if (blockedMembers.has(m.id)) return false;
+      // لا نخفي المستوردين بسبب نقص الجنس/العمر؛ يكفي وجود اسم أو رمز عضو.
+      if (!m.nickname && !m.realName && !m.id) return false;
+      const key = m.id || `idx-${idx}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+
+    // البحث بالكلمة المفتاحية / الرمز / كود العضو
+    if (featuredAccess && searchQuery.trim()) {
+      const rawQ = searchQuery.trim().toLowerCase();
+      const cleanQ = rawQ.replace('#', '').replace('tw-', '').replace('imp-', '').trim();
+      const rawId = (m.id || '').toLowerCase();
+      const cleanId = rawId.replace('#', '').replace('tw-', '').replace('imp-', '').trim();
+
+      const matchId = rawId.includes(rawQ) || (cleanQ.length > 0 && cleanId.includes(cleanQ));
+      const matchNick = (m.nickname || '').toLowerCase().includes(rawQ);
+      const matchDisplay = ((m as any).displayName || '').toLowerCase().includes(rawQ);
+      const matchUser = (m.username || '').toLowerCase().includes(rawQ);
+      const matchJob = (m.jobTitle || '').toLowerCase().includes(rawQ);
+      const matchTribe = (m.tribe || '').toLowerCase().includes(rawQ);
+      const matchBio = (m.bio || '').toLowerCase().includes(rawQ);
+      if (!matchId && !matchNick && !matchDisplay && !matchUser && !matchJob && !matchTribe && !matchBio) {
+        return false;
+      }
+    }
+
+    if (gender !== 'all' && m.gender !== gender) return false;
+    if (m.age && (m.age < ageRange[0] || m.age > ageRange[1])) return false;
+    if (country && m.country !== country) return false;
+    if (city) {
+      if (city === OTHER_CITY_OPTION || city === 'أخرى' || city.startsWith('أخرى')) {
+        // عند اختيار "أخرى (مدن أخرى)"، يُطابق الأعضاء الذين مدينتهم ليست ضمن القائمة الرئيسية لتلك الدولة
+        const targetCountry = m.country || country;
+        const db = dataService.db.getCities?.(targetCountry) || [];
+        const mainCities = db.length ? db : (CITIES_BY_COUNTRY[targetCountry] || []);
+        const normMCity = (m.city || '').trim().toLowerCase();
+        const isMain = mainCities.some((c) => c.trim().toLowerCase() === normMCity);
+        if (isMain) return false;
+      } else {
+        if (m.city !== city) return false;
+      }
+    }
+
+    // تصفية الجنسية (مطابقة مرنة تشمل الدولة والمسمى الوظيفي والنسبة)
+    if (featuredAccess && nationality) {
+      const normFilter = nationality.replace('/ة', '').replace('ة', '').replace('ال', '').trim().toLowerCase();
+      const normNat = (m.nationality || '').replace('/ة', '').replace('ة', '').replace('ال', '').trim().toLowerCase();
+      const normCountry = (m.country || '').replace('ال', '').trim().toLowerCase();
+
+      const isNatMatch = m.nationality === nationality || 
+                         normNat === normFilter || 
+                         (normNat.length > 2 && normFilter.length > 2 && (normNat.includes(normFilter) || normFilter.includes(normNat))) ||
+                         (normCountry.length > 2 && normFilter.length > 2 && (normCountry === normFilter || normCountry.includes(normFilter)));
+
+      if (!isNatMatch) return false;
+    }
+
+    if (featuredAccess && education && m.education !== education) return false;
+    
+    if (featuredAccess && job) {
+      const j = job.trim().toLowerCase();
+      const wType = (m.workType || '').toLowerCase();
+      const jTitle = (m.jobTitle || '').toLowerCase();
+      const isOtherMatch = (j === 'أخرى' || j === 'اخرى') && (wType === 'أخرى' || wType === 'اخرى' || (!['حكومي', 'قطاع خاص', 'عمل حر', 'باحث عن عمل', 'طالب', 'بدون عمل'].includes(wType) && wType !== ''));
+      const matchesWork = wType.includes(j) || isOtherMatch || (j === 'عمل حر' && (wType.includes('حر') || wType.includes('أعمال حرة'))) || (j === 'أعمال حرة' && (wType.includes('حر') || wType.includes('عمل')));
+      const matchesTitle = jTitle.includes(j);
+      if (!matchesWork && !matchesTitle) return false;
+    }
+
+    if (featuredAccess && maritalStatus) {
+      const mStatus = m.maritalStatus || '';
+      const mLabel = m.maritalLabel || '';
+      const isWidowMatch = (maritalStatus === 'widower' || maritalStatus === 'widow') && (mStatus === 'widower' || mStatus === 'widow');
+      if (mStatus !== maritalStatus && !isWidowMatch && !mLabel.includes(maritalStatus)) {
+        return false;
+      }
+    }
+
+    // تصفية المذهب (مطابقة مرنة مثل سني / مسلم سني / سلفي)
+    if (featuredAccess && sect) {
+      const normFilter = sect.replace('مسلم ', '').trim();
+      const normSect = (m.sect || '').replace('مسلم ', '').trim();
+
+      const isSectMatch = m.sect === sect || 
+                         normSect === normFilter || 
+                         normSect.includes(normFilter) || 
+                         normFilter.includes(normSect);
+
+      if (!isSectMatch) return false;
+    }
+    if (featuredAccess && hasChildren && ((hasChildren === 'true' && !m.hasChildren) || (hasChildren === 'false' && m.hasChildren))) return false;
+    if (featuredAccess && childrenCount && m.childrenCount !== childrenCount) return false;
+
+    // تصفية نوع الزواج (معلن / مسيار) — متاح لجميع الأعضاء والزوار (من اختار "لا مانع" يظهر في كلا الخيارين)
+    if (marriageType) {
+      const mTypeRaw = ((m as any).marriageType || (m as any).marriage_type || (m as any).marriageTypeLabel || '').toString().toLowerCase().trim();
+      const isBoth = ['both', 'معلن أو مسيار', 'معلن او مسيار', 'لا مانع', 'الاثنين', 'كلاهما', 'معلن ومسيار'].some(k => mTypeRaw.includes(k));
+      if (marriageType === 'announced') {
+        const isAnnounced = isBoth || ['announced', 'معلن', 'عادي', 'طبيعي'].some(k => mTypeRaw.includes(k)) || !mTypeRaw;
+        if (!isAnnounced) return false;
+      } else if (marriageType === 'misyar') {
+        const isMisyar = isBoth || ['misyar', 'مسيار'].some(k => mTypeRaw.includes(k));
+        if (!isMisyar) return false;
+      }
+    }
+
+    // تصفية قبول غير المواطن / الأجنبي
+    if (featuredAccess && acceptForeigner) {
+      const mAccRaw = ((m as any).acceptForeigner || (m as any).accept_foreigner || (m as any).pNationality || '').toString().toLowerCase().trim();
+      const accepts = ['نعم', 'yes', 'true', 'لا مانع', 'اقبل اجنبي', 'أقبل أجنبي', 'أية جنسية', 'اي جنسية'].some(k => mAccRaw.includes(k));
+      if (acceptForeigner === 'yes' && !accepts) return false;
+      if (acceptForeigner === 'no' && accepts) return false;
+    }
+
+    return true;
+  }).sort((a, b) => {
+    const scoreFor = (member: any) => currentUser && profileData
+      ? calculateCompatibility(currentUser, member, profileData).score : 0;
+    const priority = compareMemberPriority(a, b, scoreFor(a), scoreFor(b));
+    if (priority) return priority;
+
+    // Secondary: Sort by latest creation/registration date (newest first)
+    const timeA = getMemberTimestamp(a);
+    const timeB = getMemberTimestamp(b);
+    if (timeA !== timeB) {
+      return timeB - timeA;
+    }
+
+    // Tertiary: fallback comparison
+    const numA = parseInt(a.id.replace(/\D/g, '')) || 0;
+    const numB = parseInt(b.id.replace(/\D/g, '')) || 0;
+    if (numA !== numB) {
+      return numB - numA;
+    }
+
+    return (b.id || '').localeCompare(a.id || '');
+  });
+  }, [featuredAccess, currentUser, profileData, members, blockedMembers, searchQuery, gender, ageRange, country, city, nationality, education, job, maritalStatus, sect, hasChildren, childrenCount, marriageType, acceptForeigner]);
+
+  // إعادة الترقيم للصفحة الأولى عند تغيير أي فلتر لتجنّب صفحة فارغة
+  React.useEffect(() => {
+    setVisibleCount(PAGE_SIZE);
+  }, [searchQuery, gender, ageRange[0], ageRange[1], country, city, nationality, education, job, maritalStatus, sect, hasChildren, childrenCount, marriageType, acceptForeigner]);
+
+  const visibleMembers = filteredMembers.slice(0, visibleCount);
+  const hasMore = filteredMembers.length > visibleMembers.length;
+
+  const handleSearch = () => {
+    // Live results already shown below - no navigation needed
+    showToast('تم تحديث النتائج فوراً حسب الفلاتر', 'success');
+    incrementUsage('search');
+  };
+
+  const resetFilters = () => {
+    setSearchQuery('');
+    setGender('all');
+    setAgeRange([16, 80]);
+    setCountry('');
+    setCity('');
+    setMarriageType('');
+    setAcceptForeigner('');
+    setNationality('');
+    setEducation('');
+    setJob('');
+    setMaritalStatus('');
+    setSect('');
+    setHasChildren('');
+    setChildrenCount('');
+    setShowAdvanced(false);
+  };
+
+  const activeFilterCount = [
+    searchQuery.trim(),
+    gender !== 'all' ? gender : '',
+    ageRange[0] !== 16 || ageRange[1] !== 80 ? 'age' : '',
+    country,
+    city,
+    marriageType,
+    acceptForeigner,
+    nationality,
+    education,
+    job,
+    maritalStatus,
+    sect,
+    hasChildren,
+    childrenCount,
+  ].filter(Boolean).length;
+
+  return (
+    <div className="bg-[#FCFBF9] min-h-screen pb-8 sm:pb-12">
+      {/* Header banner */}
+      <div className="bg-gradient-to-l from-[#680E30] via-[#7B113A] to-[#8B1D41] relative overflow-hidden border-b border-[#D4AF37]/20 shadow-md">
+        <div className="absolute inset-0 bg-[linear-gradient(to_right,#ffffff05_1px,transparent_1px),linear-gradient(to_bottom,#ffffff05_1px,transparent_1px)] bg-[size:24px_24px]" />
+        <div className="absolute -top-20 -left-20 w-72 h-72 bg-[#D4AF37]/15 rounded-full blur-3xl pointer-events-none" />
+        <div className="relative max-w-4xl mx-auto px-4 sm:px-6 py-4 sm:py-10 text-center">
+          <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }}>
+            <div className="inline-flex items-center justify-center w-9 h-9 sm:w-12 sm:h-12 rounded-xl sm:rounded-2xl bg-white/10 border border-white/20 mb-1.5 sm:mb-3">
+              <SlidersHorizontal className="w-4.5 h-4.5 sm:w-6 sm:h-6 text-[#F3DB83]" />
+            </div>
+            <h1 className="font-cairo font-extrabold text-[19px] sm:text-3xl text-white">البحث المتقدم والتوافق</h1>
+            <p className="mt-1 sm:mt-2 text-[11px] sm:text-sm text-white/80 font-tajawal">خصّص بحثك بدقة وشفافية للعثور على شريك الحياة المناسب</p>
+          </motion.div>
+        </div>
+      </div>
+
+      <div className="max-w-3xl mx-auto px-2.5 min-[390px]:px-3 sm:px-6 -mt-3 sm:-mt-6 relative z-10">
+        <div className="bg-white rounded-2xl sm:rounded-3xl shadow-sm border border-[#EAE3D9] p-3 min-[390px]:p-3.5 sm:p-7 space-y-3 sm:space-y-6">
+
+          {/* ===== البحث بالرمز أو الكلمة المفتاحية ===== */}
+          <div>
+            <label className="flex items-center gap-1.5 text-[11px] sm:text-xs font-cairo font-bold text-navy-800 dark:text-cream-100 mb-1.5">
+              <SearchIcon className="w-3.5 h-3.5 text-gold-600" /> البحث بالرمز أو الاسم
+            </label>
+            <div className="relative">
+              <input
+                type="text"
+                value={searchQuery}
+                readOnly={!featuredAccess}
+                onFocus={() => { if (!featuredAccess) requireFeatured(); }}
+                onChange={(e) => { if (featuredAccess) setSearchQuery(e.target.value); else requireFeatured(); }}
+                placeholder="ابحث بكود العضو (مثل m1)، أو المسمى الوظيفي، أو الاسم المستعار..."
+                className="w-full h-11 px-3.5 pl-9 rounded-xl sm:rounded-2xl bg-cream-50 dark:bg-navy-950 border border-cream-200 dark:border-navy-800 focus:border-gold-500 focus:outline-none font-tajawal text-[13px] sm:text-sm text-navy-900 dark:text-cream-100 placeholder:text-navy-400"
+              />
+              <SearchIcon className="w-4 h-4 text-navy-400 absolute left-3 top-1/2 -translate-y-1/2" />
+            </div>
+          </div>
+
+          {!featuredAccess && <button type="button" onClick={requireFeatured} className="text-xs font-cairo font-bold text-gold-700">البحث بالرمز أو الاسم وبقية الفلاتر متاحة في الباقة المميزة</button>}
+          {upgradePrompt && !featuredAccess && <div role="alert" className="rounded-2xl border border-amber-200 bg-amber-50 p-4 font-cairo">
+            <p className="font-bold text-sm text-navy-900">هذا الفلتر متاح لأعضاء الباقة المميزة</p>
+            <p className="mt-1 text-xs text-navy-600">يمكنك استخدام الجنس والدولة والعمر والمدينة مجانًا.</p>
+            <div className="mt-3 flex gap-3"><Link to="/plans" className="rounded-xl bg-navy-900 px-4 py-2 text-xs font-bold text-white">الترقية إلى الباقة المميزة</Link><button type="button" onClick={() => setUpgradePrompt(false)} className="text-xs text-navy-600">متابعة البحث المجاني</button></div>
+          </div>}
+          {/* ===== الخطوة 1: الجنس (أول خيار) ===== */}
+          <FilterSection icon={Users} title="أبحث عن" step={1}>
+            <div className="grid grid-cols-3 gap-2 sm:gap-3">
+              <GenderButton
+                active={gender === 'all'} onClick={() => handleGenderChange('all')}
+                label="الجميع" color="gold"
+              />
+              <GenderButton
+                active={gender === 'male'} onClick={() => handleGenderChange('male')}
+                label="رجال" color="blue"
+              />
+              <GenderButton
+                active={gender === 'female'} onClick={() => handleGenderChange('female')}
+                label="نساء" color="rose"
+              />
+            </div>
+          </FilterSection>
+
+          {/* ===== الخطوة 2: الدولة والمدينة ===== */}
+          <FilterSection icon={MapPin} title="الدولة والمدينة" step={2}>
+            <div className="grid grid-cols-2 gap-2 sm:gap-3">
+              <SelectField icon={Globe} label="الدولة" value={country} onChange={(v) => { setCountry(v); setCity(''); }}
+                options={countryOptions} placeholder="كل الدول" />
+              <SelectField icon={MapPin} label="المدينة" value={city} onChange={setCity}
+                disabled={!country}
+                options={cityOptions} placeholder={country ? "كل المدن" : "اختر الدولة أولاً لمعاينة المدن"} />
+            </div>
+          </FilterSection>
+
+          {/* ===== الخطوة 3: العمر ===== */}
+          <FilterSection icon={Calendar} title="الفئة العمرية" step={3}>
+            <div className="grid grid-cols-2 gap-2 sm:gap-3">
+              <div className="bg-cream-50 dark:bg-navy-950 rounded-xl p-2.5 sm:p-4 border border-cream-200 dark:border-navy-800">
+                <div className="flex items-center justify-between gap-1 mb-1.5">
+                  <span className="text-[11px] sm:text-xs text-navy-500 dark:text-slate-400 font-tajawal">من</span>
+                  <span className="font-cairo font-bold text-xs sm:text-sm text-gold-700 dark:text-gold-300 bg-gold-300/15 px-2 py-0.5 rounded-lg whitespace-nowrap">{ageRange[0]} سنة</span>
+                </div>
+                <input type="range" min="16" max="80" value={ageRange[0]}
+                  onChange={(e) => setAgeRange([Math.min(Number(e.target.value), ageRange[1]), ageRange[1]])}
+                  className="w-full h-5 accent-gold-500 cursor-pointer" />
+              </div>
+              <div className="bg-cream-50 dark:bg-navy-950 rounded-xl p-2.5 sm:p-4 border border-cream-200 dark:border-navy-800">
+                <div className="flex items-center justify-between gap-1 mb-1.5">
+                  <span className="text-[11px] sm:text-xs text-navy-500 dark:text-slate-400 font-tajawal">إلى</span>
+                  <span className="font-cairo font-bold text-xs sm:text-sm text-gold-700 dark:text-gold-300 bg-gold-300/15 px-2 py-0.5 rounded-lg whitespace-nowrap">{ageRange[1]} سنة</span>
+                </div>
+                <input type="range" min="16" max="80" value={ageRange[1]}
+                  onChange={(e) => setAgeRange([ageRange[0], Math.max(Number(e.target.value), ageRange[0])])}
+                  className="w-full h-5 accent-gold-500 cursor-pointer" />
+              </div>
+            </div>
+          </FilterSection>
+
+          {/* ===== زر المزيد من الخيارات ===== */}
+          <button
+            onClick={() => { if (featuredAccess) setShowAdvanced(!showAdvanced); else requireFeatured(); }}
+            aria-expanded={showAdvanced}
+            aria-controls="advanced-search-filters"
+            className="w-full min-h-11 flex items-center justify-between px-3 py-2.5 sm:p-4 rounded-xl sm:rounded-2xl bg-navy-gradient text-white font-cairo font-bold transition-all hover:shadow-luxe relative overflow-hidden cursor-pointer"
+          >
+            <div className="absolute inset-0 pattern-arabesque opacity-20" />
+            <span className="relative flex items-center gap-2 text-xs sm:text-base min-w-0">
+              <SlidersHorizontal className="w-4 h-4 sm:w-5 sm:h-5 text-gold-300 flex-shrink-0" />
+              {showAdvanced ? 'إخفاء الخيارات المتقدمة' : 'مزيد من الخيارات'}
+              {activeFilterCount > 0 && (
+                <span className="inline-flex items-center justify-center min-w-5 h-5 px-1.5 rounded-full bg-gold-300 text-navy-950 text-[10px]">
+                  {activeFilterCount}
+                </span>
+              )}
+            </span>
+            <span className="relative">
+              {showAdvanced ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+            </span>
+          </button>
+
+          {/* ===== الخيارات المتقدمة ===== */}
+          <AnimatePresence>
+            {featuredAccess && showAdvanced && (
+              <motion.div
+                id="advanced-search-filters"
+                initial={{ height: 0, opacity: 0 }}
+                animate={{ height: 'auto', opacity: 1 }}
+                exit={{ height: 0, opacity: 0 }}
+                transition={{ duration: 0.3 }}
+                className="overflow-hidden"
+              >
+                <div className="space-y-3.5 sm:space-y-5 pt-3 border-t border-cream-200 dark:border-navy-800">
+
+                  {/* نوع الزواج (معلن / مسيار / الجميع) */}
+                  <div>
+                    <label className="flex items-center gap-1.5 text-xs font-cairo font-bold text-navy-800 dark:text-cream-100 mb-2">
+                      <Heart className="w-3.5 h-3.5 text-gold-600" /> نوع الزواج المطلوب
+                    </label>
+                    <div className="grid grid-cols-3 gap-2">
+                      <GenderButton
+                        active={marriageType === ''}
+                        onClick={() => setMarriageType('')}
+                        label="الجميع"
+                        color="gold"
+                      />
+                      <GenderButton
+                        active={marriageType === 'announced'}
+                        onClick={() => setMarriageType('announced')}
+                        label="معلن (كامل)"
+                        color="rose"
+                      />
+                      <GenderButton
+                        active={marriageType === 'misyar'}
+                        onClick={() => setMarriageType('misyar')}
+                        label="مسيار"
+                        color="amber"
+                      />
+                    </div>
+                    {marriageType && (
+                      <div className="mt-2 flex items-center justify-between text-xs px-2.5 py-1.5 rounded-lg bg-amber-50/80 border border-amber-200/60 text-amber-900">
+                        <span>تصفية نشطة: <strong>{marriageType === 'announced' ? 'الزواج المعلن (التقليدي الكامل)' : 'الزواج المسيار (بضوابطه الشرعية)'}</strong></span>
+                        <button
+                          type="button"
+                          onClick={() => setMarriageType('')}
+                          className="text-amber-800 underline font-bold cursor-pointer hover:text-amber-950"
+                        >
+                          إلغاء التحديد
+                        </button>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* الحالة الاجتماعية — تظهر عند اختيار الجنس */}
+                  {gender !== 'all' && (
+                    <div>
+                      <label className="flex items-center gap-1.5 text-xs font-cairo font-bold text-navy-800 mb-2">
+                        <Heart className="w-3.5 h-3.5 text-gold-600" /> الحالة الاجتماعية
+                        <span className="text-[11px] font-normal text-navy-400">
+                          ({gender === 'male' ? 'خيارات الرجال' : 'خيارات النساء'})
+                        </span>
+                      </label>
+                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                        {maritalOptions.map((opt) => (
+                          <button
+                            key={opt.value}
+                            onClick={() => setMaritalStatus(maritalStatus === opt.value ? '' : opt.value)}
+                            className={`min-h-11 py-2 px-2 rounded-xl font-cairo font-semibold text-xs sm:text-sm transition-all no-tap-highlight ${
+                              maritalStatus === opt.value
+                                ? 'bg-gold-gradient text-navy-900 shadow-soft'
+                                : 'bg-cream-100 text-navy-600 hover:bg-cream-200'
+                            }`}
+                          >
+                            {opt.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* عدد الأبناء — يظهر فقط للمطلق/الأرمل */}
+                  {showChildrenOptions && (
+                    <motion.div
+                      initial={{ opacity: 0, height: 0 }}
+                      animate={{ opacity: 1, height: 'auto' }}
+                      exit={{ opacity: 0, height: 0 }}
+                      className="overflow-hidden"
+                    >
+                      <label className="flex items-center gap-1.5 text-xs font-cairo font-bold text-navy-800 mb-2">
+                        <Baby className="w-3.5 h-3.5 text-gold-600" /> الأبناء
+                      </label>
+                      <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                        <button
+                          onClick={() => { setHasChildren('false'); setChildrenCount(''); }}
+                          className={`py-2.5 rounded-xl font-cairo font-semibold text-xs sm:text-sm transition-all ${
+                            hasChildren === 'false' ? 'bg-gold-gradient text-navy-900 shadow-soft' : 'bg-cream-100 text-navy-600 hover:bg-cream-200'
+                          }`}
+                        >
+                          بدون أبناء
+                        </button>
+                        <button
+                          onClick={() => setHasChildren('true')}
+                          className={`py-2.5 rounded-xl font-cairo font-semibold text-xs sm:text-sm transition-all ${
+                            hasChildren === 'true' ? 'bg-gold-gradient text-navy-900 shadow-soft' : 'bg-cream-100 text-navy-600 hover:bg-cream-200'
+                          }`}
+                        >
+                          لديه أبناء
+                        </button>
+                      </div>
+                      {hasChildren === 'true' && (
+                        <div className="mt-2">
+                          <SelectField icon={Baby} label="عدد الأبناء" value={childrenCount} onChange={setChildrenCount}
+                            options={CHILDREN_COUNTS.filter(c => c !== 'لا يوجد')} placeholder="اختر العدد" />
+                        </div>
+                      )}
+                    </motion.div>
+                  )}
+
+                  {/* قبول غير مواطن / أجنبي */}
+                  <div>
+                    <label className="flex items-center gap-1.5 text-xs font-cairo font-bold text-navy-800 mb-2">
+                      <Globe className="w-3.5 h-3.5 text-gold-600" /> قبول غير مواطن / أجنبي
+                    </label>
+                    <div className="grid grid-cols-3 gap-1.5 sm:gap-2">
+                      <button
+                        onClick={() => setAcceptForeigner('')}
+                        className={`min-h-11 py-2 px-1.5 sm:px-2 rounded-xl font-cairo font-semibold text-xs sm:text-sm transition-all ${
+                          acceptForeigner === ''
+                            ? 'bg-gold-gradient text-navy-900 shadow-soft'
+                            : 'bg-cream-100 text-navy-600 hover:bg-cream-200'
+                        }`}
+                      >
+                        الكل
+                      </button>
+                      <button
+                        onClick={() => setAcceptForeigner('yes')}
+                        className={`min-h-11 py-2 px-1.5 sm:px-2 rounded-xl font-cairo font-semibold text-xs sm:text-sm transition-all ${
+                          acceptForeigner === 'yes'
+                            ? 'bg-gold-gradient text-navy-900 shadow-soft'
+                            : 'bg-cream-100 text-navy-600 hover:bg-cream-200'
+                        }`}
+                      >
+                        يقبل أجنبي
+                      </button>
+                      <button
+                        onClick={() => setAcceptForeigner('no')}
+                        className={`min-h-11 py-2 px-1.5 sm:px-2 rounded-xl font-cairo font-semibold text-xs sm:text-sm transition-all ${
+                          acceptForeigner === 'no'
+                            ? 'bg-gold-gradient text-navy-900 shadow-soft'
+                            : 'bg-cream-100 text-navy-600 hover:bg-cream-200'
+                        }`}
+                      >
+                        مواطن فقط
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* المذهب */}
+                  <SelectField icon={BookOpen} label="المذهب" value={sect} onChange={setSect}
+                    options={SECTS} placeholder="كل المذاهب" />
+
+                  {/* الجنسية */}
+                  <SelectField icon={Globe} label="الجنسية" value={nationality} onChange={setNationality}
+                    options={nationalityOptions} placeholder="كل الجنسيات" />
+
+                  {/* التعليم والوظيفة */}
+                  <div className="grid grid-cols-2 gap-2 sm:gap-3">
+                    <SelectField icon={GraduationCap} label="التعليم" value={education} onChange={setEducation}
+                      options={EDUCATION_LEVELS} placeholder="الكل" />
+                    <SelectField icon={Briefcase} label="نوع العمل" value={job} onChange={setJob}
+                      options={WORK_TYPES} placeholder="الكل" />
+                  </div>
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+
+          {/* إجراءات البحث */}
+          <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-2">
+            <Button onClick={handleSearch} fullWidth size="md" className="shadow-gold">
+              <SearchIcon className="w-4 h-4 sm:w-5 sm:h-5" /> ابحث الآن
+            </Button>
+            <Button
+              onClick={resetFilters}
+              variant="outline"
+              size="sm"
+              disabled={activeFilterCount === 0}
+              className="whitespace-nowrap shadow-none"
+            >
+              مسح الفلاتر
+              {activeFilterCount > 0 && <span className="text-[10px]">({activeFilterCount})</span>}
+            </Button>
+          </div>
+        </div>
+      </div>
+
+      {/* عرض النتائج */}
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-12 mt-5 sm:mt-12 border-t border-cream-200/60">
+        <div className="mb-4 sm:mb-8 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+          <div>
+            <h2 className="font-cairo font-extrabold text-lg sm:text-2xl text-navy-900">
+              نتائج البحث ({filteredMembers.length})
+            </h2>
+            <p className="mt-1 text-sm text-navy-500 font-tajawal">
+              {filteredMembers.length > 0
+                ? 'مرتبة حسب الجدية والتميز — الأحدث أولاً'
+                : 'لا توجد نتائج مطابقة. جرّب تعديل الفلاتر.'}
+            </p>
+          </div>
+          {filteredMembers.length > 0 && (
+            <div className="text-xs font-tajawal text-navy-500 bg-cream-100 px-4 py-2 rounded-2xl flex items-center gap-1.5">
+              <ShieldCheck className="w-3.5 h-3.5 text-gold-600" />
+              نتائج مفلترة حسب اختيارك
+            </div>
+          )}
+        </div>
+
+        {membersError && members.length === 0 ? (
+          <div className="py-20 text-center bg-white rounded-3xl border border-rose-200/70">
+            <div className="w-12 h-12 sm:w-16 sm:h-16 rounded-full bg-rose-soft flex items-center justify-center mx-auto mb-4">
+              <SearchIcon className="w-6 h-6 sm:w-8 sm:h-8 text-rose-deep" />
+            </div>
+            <p className="font-cairo font-bold text-navy-800 text-lg mb-1">تعذر تحميل الأعضاء</p>
+            <p className="text-sm text-navy-500 font-tajawal mb-6">{membersError}</p>
+            <Button onClick={retryLoadMembers}>إعادة المحاولة</Button>
+          </div>
+        ) : membersLoading && members.length === 0 ? (
+          <div className="grid grid-cols-2 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-2.5 sm:gap-5">
+            <MemberGridSkeleton count={8} />
+          </div>
+        ) : filteredMembers.length > 0 ? (
+          <>
+            <div className="grid grid-cols-2 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-2.5 sm:gap-5">
+              {visibleMembers.map((m, idx) => (
+                <MemberCard key={m?.id ? `search-member-${m.id}-${idx}` : `search-member-idx-${idx}`} member={m} />
+              ))}
+            </div>
+            {hasMore && (
+              <div className="flex justify-center mt-6 sm:mt-8">
+                <Button onClick={() => setVisibleCount((c) => c + PAGE_SIZE)} variant="outline" size="md">
+                  عرض المزيد ({filteredMembers.length - visibleMembers.length} متبقٍ)
+                </Button>
+              </div>
+            )}
+          </>
+        ) : (
+          <div className="py-20 text-center">
+            <SearchIcon className="w-12 h-12 sm:w-16 sm:h-16 text-navy-200 mx-auto mb-4" />
+            <p className="font-cairo font-bold text-navy-700 text-lg mb-1">لا توجد نتائج مطابقة</p>
+            <p className="text-sm text-navy-400 font-tajawal mb-6">جرّب توسيع نطاق البحث أو تعديل الفلاتر</p>
+            <Button
+              onClick={() => {
+                resetFilters();
+              }}
+              variant="outline"
+              size="md"
+            >
+              إعادة ضبط الفلاتر
+            </Button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ===== مكوّنات مساعدة ===== */
+
+function FilterSection({ icon: Icon, title, step, children }: { icon: typeof Users; title: string; step: number; children: React.ReactNode }) {
+  return (
+    <div className="rounded-xl sm:rounded-none border border-cream-200/70 dark:border-navy-800 sm:border-0 p-2.5 sm:p-0 bg-cream-50/45 dark:bg-navy-950/25 sm:bg-transparent">
+      <div className="flex items-center gap-2 mb-2">
+        <span className="flex items-center justify-center w-5.5 h-5.5 sm:w-6 sm:h-6 rounded-md bg-gold-300/20 text-gold-700 dark:text-gold-300 font-cairo font-bold text-[10px] sm:text-xs flex-shrink-0">
+          {step}
+        </span>
+        <span className="flex items-center gap-1.5 text-[11px] sm:text-sm font-cairo font-bold text-navy-800 dark:text-cream-100">
+          <Icon className="w-3.5 h-3.5 text-gold-600" /> {title}
+        </span>
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function GenderButton({ active, onClick, label, color }: { active: boolean; onClick: () => void; label: string; color: 'gold' | 'blue' | 'rose' | 'amber' }) {
+  const colors = {
+    gold: active ? 'bg-[#7B113A] text-white shadow-md' : '',
+    blue: active ? 'bg-[#405878] text-white shadow-md' : '',
+    rose: active ? 'bg-[#7B113A] text-white shadow-md' : '',
+    amber: active ? 'bg-[#A16207] text-white shadow-md' : '',
+  };
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`min-h-11 px-1.5 py-2 sm:py-3.5 rounded-xl font-cairo font-bold text-[11px] sm:text-sm transition-all no-tap-highlight cursor-pointer ${
+        active ? colors[color] : 'bg-[#F7EFE6] text-neutral-700 hover:bg-[#EFE6DA]'
+      }`}
+    >
+      {label}
+    </button>
+  );
+}
+
+function SelectField({ icon: Icon, label, value, onChange, options, placeholder, disabled }: {
+  icon: typeof Globe; label: string; value: string; onChange: (v: string) => void; options: string[]; placeholder: string; disabled?: boolean;
+}) {
+  return (
+    <div>
+      <label className="flex items-center gap-2 text-xs font-cairo font-semibold text-neutral-700 mb-1.5">
+        <Icon className="w-3.5 h-3.5 text-[#7B113A]" /> {label}
+      </label>
+      <div className="relative">
+        <select
+          value={value}
+          disabled={disabled}
+          onChange={(e) => onChange(e.target.value)}
+          className={`w-full h-11 px-2.5 pl-8 rounded-xl border font-tajawal appearance-none transition-colors text-xs sm:text-sm truncate ${
+            disabled
+              ? 'bg-neutral-100 border-neutral-200 text-neutral-400 cursor-not-allowed opacity-80'
+              : 'bg-[#FCFBF9] border-[#EAE3D9] text-neutral-900 focus:border-[#7B113A] focus:outline-none cursor-pointer'
+          }`}
+        >
+          <option value="">{placeholder}</option>
+          {options.map((o, idx) => <option key={`opt-${o}-${idx}`} value={o}>{o}</option>)}
+        </select>
+        <ChevronDown className="w-4 h-4 text-neutral-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+      </div>
+    </div>
+  );
+}
